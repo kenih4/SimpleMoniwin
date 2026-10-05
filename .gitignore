@@ -11,3 +11,4 @@ __pycache__/
 old/
 output_util/
 sig/
+*.lnk

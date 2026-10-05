@@ -13,6 +13,7 @@ import argparse
 import csv
 import queue
 import re
+import subprocess
 import threading
 import time
 import urllib.error
@@ -22,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_LIST = BASE_DIR / "sig" / "signal_list_util_forPerl.csv"
+DEFAULT_LIST = BASE_DIR / "sig" / "signal_list_util_LOW_forDEBUG.csv"
 DEFAULT_OUTDIR = BASE_DIR / "output_util"
 
 BASE_URL = {
@@ -117,6 +118,20 @@ def default_csv_path(outdir: Path, when: datetime) -> Path:
     return outdir / f"util_{when:%Y%m%d%H%M}.csv"
 
 
+def save_values_txt(results: list[Result], path: Path) -> None:
+    """VALUE だけを 1 行 1 値で出力する (取得できなかった信号は空行)。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        f.write("\r\n".join(r.value for r in results) + "\r\n")
+
+
+def open_in_notepad(path: Path) -> None:
+    try:
+        subprocess.Popen(["notepad.exe", str(path)])
+    except OSError as e:
+        print(f"notepad を起動できませんでした: {e}")
+
+
 # --- CLI ------------------------------------------------------------------
 
 def run_cli(args: argparse.Namespace) -> int:
@@ -133,17 +148,22 @@ def run_cli(args: argparse.Namespace) -> int:
         print(f"{i:4d}/{len(signals)}  {sig.name:<60} {r.value}{flag}")
     save_csv(results, out)
     print(f"Saved: {out}")
+    txt = out.with_suffix(".txt")
+    save_values_txt(results, txt)
+    print(f"Saved: {txt}")
+    if not args.no_open:
+        open_in_notepad(txt)
     return 1 if any(r.status == "HTTP_ERROR" for r in results) else 0
 
 
 # --- GUI ------------------------------------------------------------------
 
-def run_gui() -> None:
+def run_gui(args: argparse.Namespace) -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
     class App(ttk.Frame):
-        def __init__(self, master: tk.Tk) -> None:
+        def __init__(self, master: tk.Tk, args: argparse.Namespace) -> None:
             super().__init__(master, padding=10)
             self.master = master
             self.q: queue.Queue = queue.Queue()
@@ -152,11 +172,10 @@ def run_gui() -> None:
             self.results: list[Result] = []
             self.when: datetime | None = None
 
-            now = datetime.now().replace(minute=0, second=0, microsecond=0)
-            self.v_date = tk.StringVar(value=now.strftime("%Y/%m/%d %H:%M"))
-            self.v_list = tk.StringVar(value=str(DEFAULT_LIST))
-            self.v_out = tk.StringVar(value=str(DEFAULT_OUTDIR))
-            self.v_wait = tk.StringVar(value="1.0")
+            self.v_date = tk.StringVar(value=args.date or datetime.now().strftime("%Y/%m/%d %H:%M"))
+            self.v_list = tk.StringVar(value=args.list)
+            self.v_out = tk.StringVar(value=args.outdir)
+            self.v_wait = tk.StringVar(value=str(args.wait))
             self.v_filter = tk.StringVar()
             self.v_status = tk.StringVar(value="日時を入力して「取得」を押してください")
 
@@ -298,7 +317,10 @@ def run_gui() -> None:
                 path = default_csv_path(Path(self.v_out.get()), self.when)
                 try:
                     save_csv(self.results, path)
+                    txt = path.with_suffix(".txt")
+                    save_values_txt(self.results, txt)
                     self.v_status.set(self.v_status.get() + f"  → {path}")
+                    open_in_notepad(txt)
                 except OSError as e:
                     messagebox.showerror("保存エラー", str(e))
 
@@ -332,22 +354,30 @@ def run_gui() -> None:
     root = tk.Tk()
     root.title("DAQ Util - 指定時刻の信号値取得")
     root.geometry("860x640")
-    App(root)
+    App(root, args)
     root.mainloop()
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cli", metavar="DATE", dest="date", help="GUI を使わず、指定日時 (YYYY/M/D+H:M) で実行")
-    ap.add_argument("--list", default=str(DEFAULT_LIST), help="信号リスト CSV")
-    ap.add_argument("--outdir", default=str(DEFAULT_OUTDIR), help="出力先ディレクトリ")
-    ap.add_argument("--wait", type=float, default=1.0, help="リクエスト間隔(秒)")
+    ap.add_argument("-d", "--date", metavar="DATE",
+                    help="取得する日時 (YYYY/M/D+H:M)。--cli なしなら GUI の初期値になる")
+    ap.add_argument("--cli", nargs="?", const=True, default=None, metavar="DATE",
+                    help="GUI を使わず実行 (DATE を付けると --date と同じ)")
+    ap.add_argument("-l", "--list", default=str(DEFAULT_LIST), help="信号リスト CSV")
+    ap.add_argument("-o", "--outdir", default=str(DEFAULT_OUTDIR), help="出力先ディレクトリ")
+    ap.add_argument("-w", "--wait", type=float, default=1.0, help="リクエスト間隔(秒)")
     ap.add_argument("--retry", type=int, default=2, help="取得失敗時のリトライ回数")
     ap.add_argument("--timeout", type=float, default=30, help="HTTP タイムアウト(秒)")
+    ap.add_argument("--no-open", action="store_true", help="CLI 実行後に notepad で開かない")
     args = ap.parse_args()
-    if args.date:
+    if isinstance(args.cli, str):
+        args.date = args.cli
+    if args.cli:
+        if not args.date:
+            args.date = datetime.now().strftime("%Y/%m/%d %H:%M")
         raise SystemExit(run_cli(args))
-    run_gui()
+    run_gui(args)
 
 
 if __name__ == "__main__":

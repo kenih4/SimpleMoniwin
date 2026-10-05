@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import queue
 import re
 import subprocess
@@ -25,6 +26,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_LIST = BASE_DIR / "sig" / "signal_list_util_LOW_forDEBUG.csv"
 DEFAULT_OUTDIR = BASE_DIR / "output_util"
+SETTINGS_PATH = BASE_DIR / "settings.json"
 
 BASE_URL = {
     "SACLA": "http://srweb-dmz-03.spring8.or.jp/cgi-bin/MDAQ/mdaq_data.py",
@@ -112,6 +114,22 @@ def save_csv(results: list[Result], path: Path) -> None:
         w.writerow(["UNIT", "SIGNAME", "SID", "VALUE", "STATUS"])
         for r in results:
             w.writerow([r.signal.unit, r.signal.name, r.signal.sid, r.value, r.status])
+
+
+def load_settings() -> dict:
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(list_path: str, outdir: str, wait: str) -> None:
+    try:
+        SETTINGS_PATH.write_text(json.dumps({"list": list_path, "outdir": outdir, "wait": wait},
+                                            ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"設定を保存できませんでした: {e}")
 
 
 def default_csv_path(outdir: Path, when: datetime) -> Path:
@@ -264,6 +282,7 @@ def run_gui(args: argparse.Namespace) -> None:
                 messagebox.showerror("入力エラー", "信号リストが空です")
                 return
 
+            save_settings(self.v_list.get(), self.v_out.get(), self.v_wait.get())
             self.when, self.results = when, []
             self.tree.delete(*self.tree.get_children())
             self.progress.configure(maximum=len(signals), value=0)
@@ -354,7 +373,13 @@ def run_gui(args: argparse.Namespace) -> None:
     root = tk.Tk()
     root.title("DAQ Util - 指定時刻の信号値取得")
     root.geometry("860x640")
-    App(root, args)
+    app = App(root, args)
+
+    def on_close() -> None:
+        save_settings(app.v_list.get(), app.v_out.get(), app.v_wait.get())
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 
@@ -364,13 +389,21 @@ def main() -> None:
                     help="取得する日時 (YYYY/M/D+H:M)。--cli なしなら GUI の初期値になる")
     ap.add_argument("--cli", nargs="?", const=True, default=None, metavar="DATE",
                     help="GUI を使わず実行 (DATE を付けると --date と同じ)")
-    ap.add_argument("-l", "--list", default=str(DEFAULT_LIST), help="信号リスト CSV")
-    ap.add_argument("-o", "--outdir", default=str(DEFAULT_OUTDIR), help="出力先ディレクトリ")
-    ap.add_argument("-w", "--wait", type=float, default=1.0, help="リクエスト間隔(秒)")
+    ap.add_argument("-l", "--list", help="信号リスト CSV (省略時は前回の設定)")
+    ap.add_argument("-o", "--outdir", help="出力先ディレクトリ (省略時は前回の設定)")
+    ap.add_argument("-w", "--wait", type=float, help="リクエスト間隔(秒) (省略時は前回の設定、なければ 1.0)")
     ap.add_argument("--retry", type=int, default=2, help="取得失敗時のリトライ回数")
     ap.add_argument("--timeout", type=float, default=30, help="HTTP タイムアウト(秒)")
     ap.add_argument("--no-open", action="store_true", help="CLI 実行後に notepad で開かない")
     args = ap.parse_args()
+    saved = load_settings()
+    args.list = args.list or saved.get("list") or str(DEFAULT_LIST)
+    args.outdir = args.outdir or saved.get("outdir") or str(DEFAULT_OUTDIR)
+    if args.wait is None:
+        try:
+            args.wait = float(saved.get("wait", 1.0))
+        except (TypeError, ValueError):
+            args.wait = 1.0
     if isinstance(args.cli, str):
         args.date = args.cli
     if args.cli:

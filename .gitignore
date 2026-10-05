@@ -1,0 +1,13 @@
+MOTO/
+bk/
+test.py
+test.txt
+利用時間表.xlsx
+*.xlsx
+*.xlsm
+.venv/
+.vscode/
+__pycache__/
+old/
+output_util/
+sig/

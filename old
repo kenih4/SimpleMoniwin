@@ -1,0 +1,172 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use v5.10;
+
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+use Getopt::Long qw(GetOptions);
+use HTTP::Tiny;
+use POSIX qw(strftime);
+use Time::HiRes qw(sleep);
+use Time::Local qw(timelocal_modern);
+
+=head1 NAME
+
+daq7_util.pl - signal_list の各信号について、指定時刻の値を MDAQ から取得して CSV に出力する
+
+=head1 SYNOPSIS
+
+    perl daq7_util.pl 2020/10/26+0:00
+    perl daq7_util.pl "2020/10/26 00:00" --list sig/signal_list_util_forPerl.csv --wait 0.5
+
+日時を省略すると対話入力になる。
+
+=head1 OPTIONS
+
+    --list FILE   信号リスト (UNIT,SIGNAME,SID)  [sig/signal_list_util_forPerl.csv]
+    --outdir DIR  出力先ディレクトリ              [output_util]
+    --wait SEC    リクエスト間隔(秒)              [1]
+    --retry N     取得失敗時のリトライ回数        [2]
+    --timeout SEC HTTP タイムアウト(秒)           [30]
+    --help
+
+=head1 OUTPUT
+
+    <outdir>/util_YYYYMMDDHHMM.csv   UNIT,SIGNAME,SID,VALUE,STATUS
+    STATUS: OK / NO_DATA (該当時刻のデータ無し) / HTTP_ERROR
+
+SIGNAME が xfel_ で始まる信号は SACLA 側、それ以外は SCSS 側のサーバに問い合わせる。
+
+=cut
+
+# --- 設定 -----------------------------------------------------------------
+my %BASE_URL = (
+    SACLA => 'http://srweb-dmz-03.spring8.or.jp/cgi-bin/MDAQ/mdaq_data.py',
+    SCSS  => 'http://xfweb-dmz-03.spring8.or.jp/cgi-bin/MDAQ/mdaq_data.py',
+);
+my $QUERY = 'sig_id=%s&b=%s&period=60&bel=bl&format=text&_style0=line'
+          . '&sampling=-1&dt_fmt=0&gw=640&s=submit';
+
+my %opt = (
+    list    => 'sig/signal_list_util_forPerl.csv',
+    outdir  => 'output_util',
+    wait    => 1,
+    retry   => 2,
+    timeout => 30,
+);
+GetOptions(\%opt, 'list=s', 'outdir=s', 'wait=f', 'retry=i', 'timeout=i', 'help')
+    or die "Usage: perl $0 [options] YYYY/M/D+H:M\n";
+if ($opt{help}) {
+    require Pod::Usage;
+    Pod::Usage::pod2usage(-verbose => 1, -exitval => 0);
+}
+
+# --- メイン ---------------------------------------------------------------
+my $date_arg = shift @ARGV;
+unless (defined $date_arg && length $date_arg) {
+    print "Enter the date. (e.g. 2013/4/17+10:00)\n> ";
+    $date_arg = <STDIN>;
+    die "No date given.\n" unless defined $date_arg;
+}
+my ($epoch, $date) = parse_date($date_arg);
+
+my $signals = read_signal_list($opt{list});
+die "No signals found in $opt{list}\n" unless @$signals;
+
+make_path($opt{outdir});
+my $out_file = sprintf '%s/util_%s.csv', $opt{outdir}, strftime('%Y%m%d%H%M', localtime $epoch);
+
+my $http = HTTP::Tiny->new(timeout => $opt{timeout}, agent => 'daq7_util/2.0');
+
+say "date   = $date";
+say "list   = $opt{list} (" . scalar(@$signals) . " signals)";
+say "output = $out_file";
+
+open my $out, '>', $out_file or die "Cannot open $out_file: $!\n";
+print {$out} "UNIT,SIGNAME,SID,VALUE,STATUS\n";
+
+my %count;
+my $n = 0;
+for my $sig (@$signals) {
+    sleep $opt{wait} if $n++ && $opt{wait} > 0;
+
+    my ($value, $status) = fetch_value($http, $sig, $date);
+    $count{$status}++;
+
+    print {$out} join(',', @{$sig}{qw(unit name sid)}, $value, $status), "\n";
+    printf "%4d/%d  %-60s %s%s\n", $n, scalar(@$signals), $sig->{name},
+        $value, ($status eq 'OK' ? '' : "  [$status]");
+}
+close $out or die "Cannot close $out_file: $!\n";
+
+say '';
+say 'Done: ' . join(', ', map { "$_=$count{$_}" } sort keys %count);
+say "Saved: $out_file";
+exit($count{HTTP_ERROR} ? 1 : 0);
+
+# --- 関数 -----------------------------------------------------------------
+
+# "2020/10/26+0:00" / "2020/10/26 0:00" -> (epoch, "2020/10/26+00:00")
+sub parse_date {
+    my ($str) = @_;
+    my ($y, $mo, $d, $h, $mi) = $str =~ m{(\d{4})/(\d+)/(\d+)[+\sT]+(\d+):(\d+)}
+        or die "Invalid date '$str'. Use YYYY/M/D+H:M (e.g. 2020/10/26+0:00)\n";
+    my $epoch = eval { timelocal_modern(0, $mi, $h, $d, $mo - 1, $y) }
+        or die "Invalid date '$str': $@";
+    return ($epoch, strftime('%Y/%m/%d+%H:%M', localtime $epoch));
+}
+
+# CSV (UNIT,SIGNAME,SID; 1行目はヘッダ) -> [ {unit,name,sid}, ... ]
+sub read_signal_list {
+    my ($file) = @_;
+    open my $in, '<', $file or die "Cannot open $file: $!\n";
+    my @list;
+    my $first = 1;
+    while (my $line = <$in>) {
+        $line =~ s/\s+//g;
+        next unless length $line;
+        if ($first) { $first = 0; next }    # header
+        my ($unit, $name, $sid) = split /,/, $line;
+        unless (defined $sid && $sid =~ /^\d+$/) {
+            warn "skip line $.: $line\n";
+            next;
+        }
+        push @list, { unit => $unit, name => $name, sid => $sid };
+    }
+    close $in;
+    return \@list;
+}
+
+# -> (value, status)
+sub fetch_value {
+    my ($http, $sig, $date) = @_;
+    my $site = $sig->{name} =~ /^xfel_/ ? 'SACLA' : 'SCSS';
+    my $url  = "$BASE_URL{$site}?" . sprintf($QUERY, $sig->{sid}, $date);
+
+    my $res;
+    for my $try (0 .. $opt{retry}) {
+        $res = $http->get($url);
+        last if $res->{success};
+        warn "GET failed ($res->{status} $res->{reason}) $sig->{name} try=" . ($try + 1) . "\n";
+        sleep 1;
+    }
+    return ('', 'HTTP_ERROR') unless $res->{success};
+
+    my $value = parse_value($res->{content});
+    return defined $value ? ($value, 'OK') : ('', 'NO_DATA');
+}
+
+# 応答テキストから値を取り出す。
+# データ行: "日時, <NONE>, 値"。日付で始まる最後の行の 3 列目を採用。
+sub parse_value {
+    my ($content) = @_;
+    my $value;
+    for my $line (split /\r?\n/, $content) {
+        next unless $line =~ m{^\d{4}/\d{1,2}/\d{1,2}};
+        my @f = split /,/, $line;
+        next unless @f >= 3;
+        ($value = $f[2]) =~ s/^\s+|\s+$//g;
+    }
+    return $value;
+}

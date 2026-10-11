@@ -4,7 +4,8 @@
     python daq_util.py                         # GUI
     python daq_util.py --cli 2026/10/05+0:00   # コマンドライン (GUI なし)
 
-標準ライブラリのみで動作する (tkinter 使用)。
+取得方法は DB (mdaq.pymdaq_web の db.get_data、既定) と Web (mdaq_data.py の CGI) から選べる。
+Web 取得のみなら標準ライブラリだけで動作する (tkinter 使用)。DB 取得には mdaq パッケージが必要。
 SIGNAME が xfel_ で始まる信号は SACLA 側、それ以外は SCSS 側のサーバに問い合わせる。
 """
 from __future__ import annotations
@@ -20,13 +21,21 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_LIST = BASE_DIR / "sig" / "signal_list_util_LOW_forDEBUG.csv"
 DEFAULT_OUTDIR = BASE_DIR / "output_util"
+RETRY_COUNT = 3    # 取得失敗時のリトライ回数
+RETRY_WAIT = 60.0  # リトライ前の待機時間(秒)
 SETTINGS_PATH = BASE_DIR / "settings.json"
+SOURCES = ("db", "web")
+DEFAULT_SOURCE = "db"
+DB_WINDOW_MIN = 60  # DB 取得時、指定時刻から遡って探す範囲(分)
+DB_FORWARD_SEC = 60  # 指定時刻から先へ含める範囲(秒)。Web 取得の period=60 (秒) と揃えている
+DB_HOST = {"SACLA": "srweb-dmz-03", "SCSS": "xfweb-dmz-03"}
+DB_PORT = 8888
 
 BASE_URL = {
     "SACLA": "http://srweb-dmz-03.spring8.or.jp/cgi-bin/MDAQ/mdaq_data.py",
@@ -91,20 +100,96 @@ def parse_value(content: str) -> str | None:
     return value
 
 
-def fetch_value(sig: Signal, when: datetime, retry: int = 2, timeout: float = 30) -> Result:
-    site = "SACLA" if sig.name.startswith("xfel_") else "SCSS"
+def site_of(sig: Signal) -> str:
+    return "SACLA" if sig.name.startswith("xfel_") else "SCSS"
+
+
+def check_db_available() -> None:
+    """mdaq.pymdaq_web が使えるか確認する。使えなければ ImportError。"""
+    from mdaq import pymdaq_web  # noqa: F401
+
+
+class DbError(Exception):
+    pass
+
+
+class DbSource:
+    """mdaq.pymdaq_web の db.get_data で値を取得する。接続はサイトごとに使い回す。"""
+
+    def __init__(self, window_min: float = DB_WINDOW_MIN) -> None:
+        self.window = timedelta(minutes=window_min)
+        self.dbs: dict = {}
+
+    def _connect(self, site: str):
+        if site not in self.dbs:
+            from mdaq import pymdaq_web
+            self.dbs[site] = pymdaq_web.db(DB_HOST[site], port=DB_PORT, debug=0)
+        return self.dbs[site]
+
+    def _drop(self, site: str) -> None:
+        db = self.dbs.pop(site, None)
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    def value_at(self, sig: Signal, when: datetime) -> str | None:
+        """[when - window, when + 60 秒] で最も新しいデータ点の値 (Web 取得と同じ時刻の解釈)。
+        範囲内にデータがない、または信号が存在しなければ None。"""
+        from mdaq import pymdaq_web
+        site = site_of(sig)
+        fmt = "%Y/%m/%d %H:%M:%S"
+        try:
+            db = self._connect(site)
+            end = when + timedelta(seconds=DB_FORWARD_SEC)
+            res = db.get_data(sig.name, (when - self.window).strftime(fmt), end.strftime(fmt))
+            if db.status() != pymdaq_web.DB_OK:
+                if "not found" in db.err_msg().lower():  # 未登録の信号はリトライしても無駄
+                    return None
+                raise DbError(f"{db.status()}: {db.err_msg()}")
+            if res is None or len(res) == 0:
+                return None
+            nd = db.conv_pointdata_to_ndarray(res, split=False, use_mdates=False)
+            if len(nd) == 0:
+                return None
+            newest = max(nd, key=lambda row: row[0])  # 並び順に依存しない
+            return format(float(newest[1]), ".7g")
+        except Exception as e:
+            self._drop(site)  # 次のリトライで再接続する
+            raise DbError(str(e)) from e
+
+    def close(self) -> None:
+        for site in list(self.dbs):
+            self._drop(site)
+
+
+def fetch_value(sig: Signal, when: datetime, retry: int = RETRY_COUNT, timeout: float = 30,
+                retry_wait: float = RETRY_WAIT, stop: threading.Event | None = None,
+                on_retry=None, db: DbSource | None = None) -> Result | None:
+    """取得に失敗したら retry_wait 秒待って最大 retry 回リトライする。待機中に stop が立てば None。
+    db を渡すと DB (db.get_data) から、None なら Web から取得する。"""
     date = when.strftime("%Y/%m/%d+%H:%M")
-    url = f"{BASE_URL[site]}?{QUERY.format(sid=sig.sid, date=date)}"
+    url = f"{BASE_URL[site_of(sig)]}?{QUERY.format(sid=sig.sid, date=date)}"
     for attempt in range(retry + 1):
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as res:
-                content = res.read().decode("utf-8", errors="replace")
-            value = parse_value(content)
+            if db is not None:
+                value = db.value_at(sig, when)
+            else:
+                with urllib.request.urlopen(url, timeout=timeout) as res:
+                    content = res.read().decode("utf-8", errors="replace")
+                value = parse_value(content)
             return Result(sig, value or "", "OK" if value is not None else "NO_DATA")
-        except (urllib.error.URLError, TimeoutError, OSError):
+        except (urllib.error.URLError, TimeoutError, OSError, DbError):
             if attempt < retry:
-                time.sleep(1)
-    return Result(sig, "", "HTTP_ERROR")
+                if on_retry:
+                    on_retry(sig, attempt + 1, retry, retry_wait)
+                if stop is not None:
+                    if stop.wait(retry_wait):
+                        return None
+                else:
+                    time.sleep(retry_wait)
+    return Result(sig, "", "HTTP_ERROR")  # DB/Web を問わず通信・取得エラー
 
 
 def save_csv(results: list[Result], path: Path) -> None:
@@ -124,9 +209,9 @@ def load_settings() -> dict:
         return {}
 
 
-def save_settings(list_path: str, outdir: str, wait: str) -> None:
+def save_settings(list_path: str, outdir: str, wait: str, source: str) -> None:
     try:
-        SETTINGS_PATH.write_text(json.dumps({"list": list_path, "outdir": outdir, "wait": wait},
+        SETTINGS_PATH.write_text(json.dumps({"list": list_path, "outdir": outdir, "wait": wait, "source": source},
                                             ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as e:
         print(f"設定を保存できませんでした: {e}")
@@ -157,13 +242,30 @@ def run_cli(args: argparse.Namespace) -> int:
     signals = read_signal_list(Path(args.list))
     out = default_csv_path(Path(args.outdir), when)
     results: list[Result] = []
-    for i, sig in enumerate(signals, 1):
-        if i > 1 and args.wait > 0:
-            time.sleep(args.wait)
-        r = fetch_value(sig, when, args.retry, args.timeout)
-        results.append(r)
-        flag = "" if r.status == "OK" else f"  [{r.status}]"
-        print(f"{i:4d}/{len(signals)}  {sig.name:<60} {r.value}{flag}")
+    db = None
+    if args.source == "db":
+        try:
+            check_db_available()
+        except ImportError as e:
+            print(f"DB 取得に必要な mdaq パッケージを読み込めません: {e}\n"
+                  f"--source web を指定すると Web から取得できます。")
+            return 2
+        db = DbSource(args.db_window)
+    print(f"取得方法: {'DB (db.get_data)' if db else 'Web'}")
+    try:
+        for i, sig in enumerate(signals, 1):
+            if i > 1 and args.wait > 0:
+                time.sleep(args.wait)
+            r = fetch_value(sig, when, args.retry, args.timeout, args.retry_wait,
+                            on_retry=lambda s, n, m, w: print(
+                                f"      取得失敗: {s.name}  {w:g}秒後にリトライ ({n}/{m})", flush=True),
+                            db=db)
+            results.append(r)
+            flag = "" if r.status == "OK" else f"  [{r.status}]"
+            print(f"{i:4d}/{len(signals)}  {sig.name:<60} {r.value}{flag}")
+    finally:
+        if db:
+            db.close()
     save_csv(results, out)
     print(f"Saved: {out}")
     txt = out.with_suffix(".txt")
@@ -194,6 +296,8 @@ def run_gui(args: argparse.Namespace) -> None:
             self.v_list = tk.StringVar(value=args.list)
             self.v_out = tk.StringVar(value=args.outdir)
             self.v_wait = tk.StringVar(value=str(args.wait))
+            self.v_source = tk.StringVar(value=args.source)
+            self.db_window = args.db_window
             self.v_filter = tk.StringVar()
             self.v_status = tk.StringVar(value="日時を入力して「取得」を押してください")
 
@@ -222,8 +326,16 @@ def run_gui(args: argparse.Namespace) -> None:
             ttk.Spinbox(self, from_=0, to=10, increment=0.1, textvariable=self.v_wait,
                         width=6).grid(row=3, column=1, sticky="w", pady=2)
 
+            ttk.Label(self, text="取得方法").grid(row=4, column=0, sticky="w")
+            sf = ttk.Frame(self)
+            sf.grid(row=4, column=1, columnspan=2, sticky="w", pady=2)
+            ttk.Radiobutton(sf, text="DB (db.get_data)", value="db",
+                            variable=self.v_source).pack(side="left")
+            ttk.Radiobutton(sf, text="Web", value="web",
+                            variable=self.v_source).pack(side="left", padx=12)
+
             bar = ttk.Frame(self)
-            bar.grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
+            bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
             self.btn_start = ttk.Button(bar, text="取得", command=self._start)
             self.btn_start.pack(side="left")
             self.btn_stop = ttk.Button(bar, text="中止", command=self._stop, state="disabled")
@@ -236,7 +348,7 @@ def run_gui(args: argparse.Namespace) -> None:
             self.v_filter.trace_add("write", lambda *_: self._refresh_table())
 
             self.progress = ttk.Progressbar(self, mode="determinate")
-            self.progress.grid(row=5, column=0, columnspan=3, sticky="ew")
+            self.progress.grid(row=6, column=0, columnspan=3, sticky="ew")
 
             cols = ("unit", "name", "sid", "value", "status")
             self.tree = ttk.Treeview(self, columns=cols, show="headings", height=18)
@@ -247,11 +359,11 @@ def run_gui(args: argparse.Namespace) -> None:
             self.tree.tag_configure("bad", foreground="#c0392b")
             sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
             self.tree.configure(yscrollcommand=sb.set)
-            self.tree.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
-            sb.grid(row=6, column=2, sticky="ns", pady=(6, 0))
-            self.rowconfigure(6, weight=1)
+            self.tree.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+            sb.grid(row=7, column=2, sticky="ns", pady=(6, 0))
+            self.rowconfigure(7, weight=1)
 
-            ttk.Label(self, textvariable=self.v_status).grid(row=7, column=0, columnspan=3,
+            ttk.Label(self, textvariable=self.v_status).grid(row=8, column=0, columnspan=3,
                                                              sticky="w", pady=(6, 0))
 
         # -- 入力補助
@@ -282,7 +394,16 @@ def run_gui(args: argparse.Namespace) -> None:
                 messagebox.showerror("入力エラー", "信号リストが空です")
                 return
 
-            save_settings(self.v_list.get(), self.v_out.get(), self.v_wait.get())
+            source = self.v_source.get()
+            if source == "db":
+                try:
+                    check_db_available()
+                except ImportError as e:
+                    messagebox.showerror("DB 取得を使えません",
+                                         f"mdaq パッケージを読み込めません:\n{e}\n\n"
+                                         "取得方法を Web にしてください。")
+                    return
+            save_settings(self.v_list.get(), self.v_out.get(), self.v_wait.get(), source)
             self.when, self.results = when, []
             self.tree.delete(*self.tree.get_children())
             self.progress.configure(maximum=len(signals), value=0)
@@ -291,27 +412,40 @@ def run_gui(args: argparse.Namespace) -> None:
             self.btn_stop.configure(state="normal")
             self.btn_save.configure(state="disabled")
             self.v_status.set(f"取得中... 0/{len(signals)}")
-            self.worker = threading.Thread(target=self._work, args=(signals, when, wait), daemon=True)
+            self.worker = threading.Thread(target=self._work, args=(signals, when, wait, source), daemon=True)
             self.worker.start()
 
         def _stop(self) -> None:
             self.stop_event.set()
             self.btn_stop.configure(state="disabled")
 
-        def _work(self, signals: list[Signal], when: datetime, wait: float) -> None:
-            for i, sig in enumerate(signals):
-                if self.stop_event.is_set():
-                    break
-                if i and wait > 0 and self.stop_event.wait(wait):
-                    break
-                self.q.put(("result", fetch_value(sig, when), len(signals)))
-            self.q.put(("done", None, len(signals)))
+        def _work(self, signals: list[Signal], when: datetime, wait: float, source: str) -> None:
+            db = DbSource(self.db_window) if source == "db" else None
+            try:
+                for i, sig in enumerate(signals):
+                    if self.stop_event.is_set():
+                        break
+                    if i and wait > 0 and self.stop_event.wait(wait):
+                        break
+                    r = fetch_value(sig, when, stop=self.stop_event, on_retry=self._on_retry, db=db)
+                    if r is None:
+                        break
+                    self.q.put(("result", r, len(signals)))
+            finally:
+                if db:
+                    db.close()
+                self.q.put(("done", None, len(signals)))
+
+        def _on_retry(self, sig: Signal, n: int, m: int, w: float) -> None:
+            self.q.put(("retry", f"取得失敗: {sig.name}  {w:g}秒後にリトライ ({n}/{m})", 0))
 
         def _poll(self) -> None:
             try:
                 while True:
                     kind, r, total = self.q.get_nowait()
-                    if kind == "result":
+                    if kind == "retry":
+                        self.v_status.set(r)
+                    elif kind == "result":
                         self.results.append(r)
                         self.progress.configure(value=len(self.results))
                         self.v_status.set(f"取得中... {len(self.results)}/{total}")
@@ -350,8 +484,9 @@ def run_gui(args: argparse.Namespace) -> None:
 
         def _insert(self, r: Result) -> None:
             s = r.signal
-            self.tree.insert("", "end", values=(s.unit, s.name, s.sid, r.value, r.status),
-                             tags=() if r.status == "OK" else ("bad",))
+            item = self.tree.insert("", "end", values=(s.unit, s.name, s.sid, r.value, r.status),
+                                    tags=() if r.status == "OK" else ("bad",))
+            self.tree.see(item)  # 最新行まで自動スクロール
 
         def _refresh_table(self) -> None:
             self.tree.delete(*self.tree.get_children())
@@ -376,7 +511,7 @@ def run_gui(args: argparse.Namespace) -> None:
     app = App(root, args)
 
     def on_close() -> None:
-        save_settings(app.v_list.get(), app.v_out.get(), app.v_wait.get())
+        save_settings(app.v_list.get(), app.v_out.get(), app.v_wait.get(), app.v_source.get())
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
@@ -392,7 +527,12 @@ def main() -> None:
     ap.add_argument("-l", "--list", help="信号リスト CSV (省略時は前回の設定)")
     ap.add_argument("-o", "--outdir", help="出力先ディレクトリ (省略時は前回の設定)")
     ap.add_argument("-w", "--wait", type=float, help="リクエスト間隔(秒) (省略時は前回の設定、なければ 1.0)")
-    ap.add_argument("--retry", type=int, default=2, help="取得失敗時のリトライ回数")
+    ap.add_argument("-s", "--source", choices=SOURCES,
+                    help="取得方法: db=db.get_data / web=CGI (省略時は前回の設定、なければ db)")
+    ap.add_argument("--db-window", type=float, default=DB_WINDOW_MIN,
+                    help="DB 取得時、指定時刻から遡ってデータを探す範囲(分)")
+    ap.add_argument("--retry", type=int, default=RETRY_COUNT, help="取得失敗時のリトライ回数")
+    ap.add_argument("--retry-wait", type=float, default=RETRY_WAIT, help="リトライまでの待機時間(秒)")
     ap.add_argument("--timeout", type=float, default=30, help="HTTP タイムアウト(秒)")
     ap.add_argument("--no-open", action="store_true", help="CLI 実行後に notepad で開かない")
     args = ap.parse_args()
@@ -404,6 +544,8 @@ def main() -> None:
             args.wait = float(saved.get("wait", 1.0))
         except (TypeError, ValueError):
             args.wait = 1.0
+    if args.source is None:
+        args.source = saved.get("source") if saved.get("source") in SOURCES else DEFAULT_SOURCE
     if isinstance(args.cli, str):
         args.date = args.cli
     if args.cli:
